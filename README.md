@@ -19,6 +19,9 @@ Example
 # comp_file_path define the id logging file path.
 comp_file_path = "./fn/"
 
+# polling projects interval (seconds)
+polling_interval = 60
+
 
 # Setting projects that you want to poll changes and notify.
 [[projects]]
@@ -29,6 +32,8 @@ url = "https://redmine.org/projects/sample-project-01/activity.atom?key=xxxxxx"
   [projects.slack]
   # bot_name
   bot_name = "bot_name"
+  # The maximum number of lines to send slack(content only)
+  max_lines = 3
   # webhook_url
   webhook_url = "https://hooks.slack.com/services/xxxxxxxx"
   # channel(post to) and bot's icon

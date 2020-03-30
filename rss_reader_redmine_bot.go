@@ -3,6 +3,10 @@ package main
 import (
 	"fmt"
 	"os"
+	"os/signal"
+	"syscall"
+	"sync"
+	"context"
 	"io"
 	"strings"
 	"net/http"
@@ -18,7 +22,8 @@ import (
 )
 
 type Config struct {
-	CompFilePath  string `toml:"comp_file_path"`
+	CompFilePath    string `toml:"comp_file_path"`
+	PollingInterval int    `toml:"polling_interval"`
 	Projects []Project
 }
 
@@ -33,6 +38,7 @@ type Slack struct {
 	Channel    string `toml:"channel"`
 	BotName    string `toml:"bot_name"`
 	Icon       string `toml:"icon"`
+	MaxLines   int    `toml:"max_lines"`
 }
 
 var (
@@ -41,9 +47,16 @@ var (
 	redmineProxy = kingpin.Flag("redmine.proxy", "Set Proxy to redmine server").Default("").String()
 	slackProxy = kingpin.Flag("slack.proxy", "Set Proxy to slack api").Default("").String()
 	dryrun = kingpin.Flag("dryrun", "Set Proxy to slack api").Bool()
+
+	wg sync.WaitGroup
 )
 
-func main(){
+
+func main() {
+	os.Exit(run())
+}
+
+func run() int{
 	// Setting logger
 	w := log.NewSyncWriter(os.Stdout)
 	logger = log.NewLogfmtLogger(w)
@@ -53,7 +66,8 @@ func main(){
         )
 	logger = log.With(logger, "timestamp", format, "caller", log.DefaultCaller)
 	logger = level.NewFilter(logger, level.AllowInfo())
-	level.Info(logger).Log("msg", "Start rss reader for redmine")
+        pid := os.Getpid()
+	level.Info(logger).Log("msg", "Start rss reader for redmine", "pid", pid)
 
 	// parse args
 	kingpin.Parse()
@@ -62,34 +76,65 @@ func main(){
 	_, err := toml.DecodeFile(*configFile, &conf)
 	if err != nil {
 		level.Error(logger).Log("msg", "Config parse error", "error", err)
-		os.Exit(1)
+		return 1
 	}
+
+	
+	var term = make(chan os.Signal, 1)
+	signal.Notify(term, os.Interrupt, syscall.SIGTERM)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer func() {
+		cancel()
+		wg.Wait()
+	}()
 
 	// Start polling rss
-	for _, project := range conf.Projects {
-		err = pollProject(project, conf.CompFilePath)
-		if err != nil {
-			level.Error(logger).Log("msg", "Polling Aborted", "project_id", project.Id, "error", err)
+	wg.Add(1)
+	go pollProjects(ctx, conf.PollingInterval, conf.Projects, conf.CompFilePath)
+
+	for {
+		select {
+			case <-term:
+				level.Info(logger).Log("msg", "Ended", "pid", pid)
+				return 0
 		}
 	}
-	// end
-	level.Info(logger).Log("msg", "Ended")
 }
 
-func pollProject (p Project, path string) (error) {
+func pollProjects(ctx context.Context, interval int, pjs []Project, path string) {
+	defer wg.Done()
+	go func() {
+		ticker := time.NewTicker(time.Duration(interval) * time.Second)
+	loop:
+		for {
+			select {
+			case <-ticker.C:
+				for _, project := range pjs {
+					wg.Add(1)
+					go pollProject(project, path)
+				}
+			case <-ctx.Done():
+				level.Info(logger).Log("msg", "poll projects routine ended.")
+				break loop
+			}
+		}
+	}()
+}
+
+
+func pollProject (p Project, path string){
+	defer wg.Done()
 	url := p.Url
 	bkFile := path + p.Id + ".log"
 
 	currentId, err := loadCurrentId(bkFile)
 	if err != nil {
 		level.Error(logger).Log("error", err)
-		return err
 	}
 
 	feed, err := parseBodyByUrl(url)
 	if err != nil {
 		level.Error(logger).Log("error", err)
-		return err
 	}
 	var entryList []atom.Entry
 	for _, entry := range feed.Entries {
@@ -110,10 +155,8 @@ func pollProject (p Project, path string) (error) {
 		err = logEntryId(bkFile, entryList[i].ID)
 		if err != nil {
 			level.Error(logger).Log("error", err)
-			return err
 		}
 	}
-	return nil
 }
 
 func sendSlack(s Slack, e atom.Entry) (error) {
@@ -122,8 +165,9 @@ func sendSlack(s Slack, e atom.Entry) (error) {
 	for _, person := range e.Authors {
 		authors = authors + person.Name
 	}
-	attachment.AddField(slack.Field { Title: "Authors", Value: authors, Short: true })
-	attachment.AddField(slack.Field { Title: "Content", Value: html2md.Convert(e.Content.Value)})
+	content := countRune(html2md.Convert(e.Content.Value), '\n', s.MaxLines)
+	attachment.AddField(slack.Field { Title: "Authors", Value: authors})
+	attachment.AddField(slack.Field { Title: "Content", Value: content})
 	payload := slack.Payload {
 		Text: "<" + e.Links[0].Href + "|" + e.Title + ">",
 		Username: s.BotName,
@@ -136,6 +180,7 @@ func sendSlack(s Slack, e atom.Entry) (error) {
 	if len(err) > 0 {
 		return fmt.Errorf("error: %s\n", err)
 	}
+	level.Info(logger).Log("msg", "Entity Sended", "Title", e.Title)
 	return nil
 }
 
@@ -200,4 +245,19 @@ func parseBodyByUrl(url string) (*atom.Feed, error) {
 	}	
 		
 	return ap.Parse(resp.Body)
+}
+
+func countRune(s string, r rune, m int) string {
+	count := 0
+	res := ""
+	for _, c := range s {
+		if c == r {
+			count++
+		}
+		res = res + string(c)
+		if count > m {
+			return res + "..."
+		}
+	}
+	return res
 }
