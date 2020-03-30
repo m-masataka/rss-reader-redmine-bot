@@ -38,7 +38,6 @@ type Slack struct {
 	Channel    string `toml:"channel"`
 	BotName    string `toml:"bot_name"`
 	Icon       string `toml:"icon"`
-	MaxLines   int    `toml:"max_lines"`
 }
 
 var (
@@ -130,11 +129,13 @@ func pollProject (p Project, path string){
 	currentId, err := loadCurrentId(bkFile)
 	if err != nil {
 		level.Error(logger).Log("error", err)
+		return
 	}
 
 	feed, err := parseBodyByUrl(url)
 	if err != nil {
 		level.Error(logger).Log("error", err)
+		return
 	}
 	var entryList []atom.Entry
 	for _, entry := range feed.Entries {
@@ -155,19 +156,20 @@ func pollProject (p Project, path string){
 		err = logEntryId(bkFile, entryList[i].ID)
 		if err != nil {
 			level.Error(logger).Log("error", err)
+			return
 		}
 	}
 }
 
 func sendSlack(s Slack, e atom.Entry) (error) {
 	attachment := slack.Attachment {}
-	authors := ""
+	authors := "Author: "
 	for _, person := range e.Authors {
 		authors = authors + person.Name
 	}
-	content := countRune(html2md.Convert(e.Content.Value), '\n', s.MaxLines)
-	attachment.AddField(slack.Field { Title: "Authors", Value: authors})
-	attachment.AddField(slack.Field { Title: "Content", Value: content})
+	text := html2md.Convert(e.Content.Value)
+	attachment.Text = &text
+	attachment.Footer =  &authors
 	payload := slack.Payload {
 		Text: "<" + e.Links[0].Href + "|" + e.Title + ">",
 		Username: s.BotName,
@@ -245,19 +247,4 @@ func parseBodyByUrl(url string) (*atom.Feed, error) {
 	}	
 		
 	return ap.Parse(resp.Body)
-}
-
-func countRune(s string, r rune, m int) string {
-	count := 0
-	res := ""
-	for _, c := range s {
-		if c == r {
-			count++
-		}
-		res = res + string(c)
-		if count > m {
-			return res + "..."
-		}
-	}
-	return res
 }
